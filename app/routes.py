@@ -1,4 +1,5 @@
 import time
+import logging
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
 from pathlib import Path
@@ -6,6 +7,7 @@ from typing import Dict
 from uuid import uuid4
 
 router = APIRouter()
+logger = logging.getLogger("uvicorn")
 
 BASE_DIR = Path(__file__).parent.parent
 MAPS_DIR = BASE_DIR / "maps"
@@ -38,7 +40,6 @@ def preprocess_levels():
     global LEVEL_METADATA
     
     for map_file in MAPS_DIR.glob("level_*.txt"):
-        # Extract level number from filename
         number_part = map_file.stem.replace("level_", "")
         if not number_part.isdigit():
             continue
@@ -46,11 +47,15 @@ def preprocess_levels():
         level_num = int(number_part)
         content = map_file.read_text()
         
+        # Split into map section and collision lines section
+        sections = content.strip().split('\n\n')
+        map_section = sections[0]  # Only process the map grid
+        
         # Count tanks by type
         tank_counts = {}
         player_spawn = None
         
-        for row_idx, line in enumerate(content.split('\n')):
+        for row_idx, line in enumerate(map_section.split('\n')):
             if line.strip() and ' ' in line:
                 for col_idx, cell in enumerate(line.split()):
                     if cell.isdigit():
@@ -69,6 +74,8 @@ def preprocess_levels():
                 for tank_type in tank_counts.keys()
             }
         }
+        
+    logger.info(f"Level Metadata: {LEVEL_METADATA}")
 
 # Call on startup
 preprocess_levels()
@@ -93,64 +100,84 @@ async def start_game():
         "completed_levels": []
     }
     
+    logger.info(f"Created new run with ID: {run_id}")
+    
     return {"run_id": run_id, "message": "Game started", "level": 1}
 
 @router.post("/game-event")
-async def game_event(run_id: str, tank_type: int):
-    if run_id not in ACTIVE_RUNS:
-        raise HTTPException(status_code=404, detail="Run not found")
-    
+async def game_event(data: dict):
+    run_id = data.get("run_id") # str
+    tank_type = data.get("tank_type") # int
     game_state = ACTIVE_RUNS[run_id]
     current_level = game_state["current_level"]
     
-    # Validate level exists and tank type is valid
-    if current_level not in LEVEL_METADATA:
-        raise HTTPException(status_code=400, detail="Invalid level")
-    
-    level_info = LEVEL_METADATA[current_level]
-    if tank_type not in level_info["enemy_tank_types"]:
-        raise HTTPException(status_code=400, detail="Invalid tank type for current level")
-    
-    # Track elimination
-    if current_level not in game_state["tanks_eliminated"]:
-        game_state["tanks_eliminated"][current_level] = {}
-    
-    level_eliminations = game_state["tanks_eliminated"][current_level]
-    level_eliminations[tank_type] = level_eliminations.get(tank_type, 0) + 1
-    
-    # Check if player eliminated more tanks than exist
-    if level_eliminations[tank_type] > level_info["enemy_tank_types"][tank_type]:
-        raise HTTPException(status_code=400, detail="Too many tanks eliminated")
-    
-    # Check if level is complete
-    total_eliminated_this_level = sum(level_eliminations.values())
-    level_complete = total_eliminated_this_level == level_info["total_enemy_tanks"]
-    
-    response = {
-        "message": "Tank elimination recorded",
-        "tank_type": tank_type,
-        "level_complete": level_complete
-    }
-    
-    if level_complete:
-      game_state["completed_levels"].append(current_level)
+    if TANK_TYPES[tank_type] == "player":
+      logger.info(f"{run_id} was eliminated")
       
-      # Check if next level exists before incrementing
-      next_level = current_level + 1
-      next_map_file = MAPS_DIR / f"level_{next_level}.txt"
+      # Reset tank eliminations for current level
+      if current_level in game_state["tanks_eliminated"]:
+          del game_state["tanks_eliminated"][current_level]
       
-      if next_map_file.exists():
-          game_state["current_level"] = next_level
-          response["next_level"] = next_level
-          response["message"] = "Level complete! Advancing to next level."
-      else:
-          response["game_complete"] = True
-          response["message"] = "Congratulations! Game completed!"
+      return {
+          "message": "Player eliminated - level reset",
+          "level_reset": True,
+          "current_level": current_level
+      }
+    else:
+      if run_id not in ACTIVE_RUNS:
+          raise HTTPException(status_code=404, detail="Run not found")
+      
+      # Validate level exists and tank type is valid
+      if current_level not in LEVEL_METADATA:
+          raise HTTPException(status_code=400, detail="Invalid level")
+      
+      level_info = LEVEL_METADATA[current_level]
+      if tank_type not in level_info["enemy_tank_types"]:
+          raise HTTPException(status_code=400, detail="Invalid tank type for current level")
+      
+      # Track elimination
+      if current_level not in game_state["tanks_eliminated"]:
+          game_state["tanks_eliminated"][current_level] = {}
+      
+      level_eliminations = game_state["tanks_eliminated"][current_level]
+      level_eliminations[tank_type] = level_eliminations.get(tank_type, 0) + 1
+      
+      # Check if player eliminated more tanks than exist
+      if level_eliminations[tank_type] > level_info["enemy_tank_types"][tank_type]:
+          raise HTTPException(status_code=400, detail="Too many tanks eliminated")
+      
+      # Check if level is complete
+      total_eliminated_this_level = sum(level_eliminations.values())
+      level_complete = total_eliminated_this_level == level_info["total_enemy_tanks"]
+      
+      logger.info(f"{run_id} eliminated tank with ID {tank_type} - {total_eliminated_this_level} out of {level_info['total_enemy_tanks']}")
+      
+      response = {
+          "message": "Tank elimination recorded",
+          "tank_type": tank_type,
+          "level_complete": level_complete
+      }
+      
+      if level_complete:
+        game_state["completed_levels"].append(current_level)
+        
+        # Check if next level exists before incrementing
+        next_level = current_level + 1
+        next_map_file = MAPS_DIR / f"level_{next_level}.txt"
+        
+        if next_map_file.exists():
+            game_state["current_level"] = next_level
+            response["next_level"] = next_level
+            response["message"] = "Level complete! Advancing to next level."
+        else:
+            response["game_complete"] = True
+            response["message"] = "Congratulations! Game completed!"
 
     return response
 
-@router.get("/level")
-async def get_current_level(run_id: str):
+@router.post("/level")
+async def get_current_level(data: dict):
+    run_id = data.get("run_id")
     if run_id not in ACTIVE_RUNS:
         raise HTTPException(status_code=404, detail="Run not found")
     
@@ -162,11 +189,6 @@ async def get_current_level(run_id: str):
         return {"game_complete": True, "final_level": current_level - 1}
     
     return PlainTextResponse(map_file.read_text())
-  
-@router.post("/player-death")
-async def player_death(run_id: str):
-    # Reset level status, deduct life/end run
-    pass
 
 @router.post("/submit-score")
 async def submit_score(run_id: str, username: str):
