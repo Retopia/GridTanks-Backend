@@ -1,10 +1,19 @@
-import time
 import logging
-from fastapi import APIRouter, HTTPException
+import time
+
+from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import PlainTextResponse
+
 from pathlib import Path
 from typing import Dict
 from uuid import uuid4
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, desc
+
+from .database import get_db
+from .models import LeaderboardEntry, ContactInfo
+
 
 router = APIRouter()
 logger = logging.getLogger("uvicorn")
@@ -218,7 +227,7 @@ async def get_final_stats(data: dict):
     }
 
 @router.post("/submit-score")
-async def submit_score(data: dict):
+async def submit_score(data: dict, db: AsyncSession = Depends(get_db)):
     run_id = data.get("run_id")
     username = data.get("username")
     email = data.get("email")
@@ -228,34 +237,37 @@ async def submit_score(data: dict):
     
     game_state = ACTIVE_RUNS[run_id]
     
-    # Use the frozen end_time if it exists, otherwise freeze it now
+    # Use frozen time
     if "end_time" not in game_state:
         game_state["end_time"] = time.time()
     
-    # Calculate final score using frozen time
     final_level = game_state["current_level"]
-    total_time_seconds = game_state["end_time"] - game_state["start_time"]
+    total_time_seconds = int(game_state["end_time"] - game_state["start_time"])
     
     # Format time as MM:SS
-    minutes = int(total_time_seconds // 60)
-    seconds = int(total_time_seconds % 60)
+    minutes = total_time_seconds // 60
+    seconds = total_time_seconds % 60
     formatted_time = f"{minutes}:{seconds:02d}"
     
-    # Store in database/leaderboard here
-    score_data = {
-        "username": username,
-        "stage_reached": final_level,
-        "time": formatted_time,
-        "date_submitted": time.time()
-    }
+    # Create leaderboard entry
+    leaderboard_entry = LeaderboardEntry(
+        username=username,
+        stage_reached=final_level,
+        time_seconds=total_time_seconds,
+        formatted_time=formatted_time
+    )
+    
+    db.add(leaderboard_entry)
     
     # Store email separately if provided
-    if email:
-        contact_data = {
-            "username": username,
-            "email": email,
-            "submission_date": time.time()
-        }
+    if email and email.strip():
+        contact_entry = ContactInfo(
+            username=username,
+            email=email.strip().lower()
+        )
+        db.add(contact_entry)
+    
+    await db.commit()
     
     # Clean up run
     del ACTIVE_RUNS[run_id]
@@ -266,3 +278,34 @@ async def submit_score(data: dict):
         "time": formatted_time,
         "username": username
     }
+    
+@router.get("/leaderboard")
+async def get_leaderboard(
+        page: int = 1, 
+        limit: int = 50,
+        db: AsyncSession = Depends(get_db)
+    ):
+        offset = (page - 1) * limit
+        
+        # Order by stage (desc), then by time (asc) for same stage
+        query = select(LeaderboardEntry).order_by(
+            desc(LeaderboardEntry.stage_reached),
+            LeaderboardEntry.time_seconds.asc()
+        ).offset(offset).limit(limit)
+        
+        result = await db.execute(query)
+        entries = result.scalars().all()
+        
+        return {
+            "entries": [
+                {
+                    "username": entry.username,
+                    "stage_reached": entry.stage_reached,
+                    "time": entry.formatted_time,
+                    "date_submitted": entry.date_submitted.strftime("%m/%d/%Y")
+                }
+                for entry in entries
+            ],
+            "page": page,
+            "limit": limit
+        }

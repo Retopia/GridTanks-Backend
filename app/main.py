@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routes import router
 from dotenv import load_dotenv
 import os
+from contextlib import asynccontextmanager
+from .database import create_tables
 
 load_dotenv()
 
@@ -19,7 +21,12 @@ origins = [
     "https://www.tanks.prestontang.dev",
 ]
 
-app = FastAPI(title="GridTanks API", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await create_tables()
+    yield
+
+app = FastAPI(title="GridTanks API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
