@@ -190,25 +190,79 @@ async def get_current_level(data: dict):
     
     return PlainTextResponse(map_file.read_text())
 
-@router.post("/submit-score")
-async def submit_score(run_id: str, username: str):
+@router.post("/get-final-stats")
+async def get_final_stats(data: dict):
+    run_id = data.get("run_id")
+    
     if run_id not in ACTIVE_RUNS:
         raise HTTPException(status_code=404, detail="Run not found")
     
     game_state = ACTIVE_RUNS[run_id]
     
-    # Calculate final score
-    final_level = max(game_state["completed_levels"]) if game_state["completed_levels"] else 0
-    total_time = time.time() - game_state["start_time"]
+    # Freeze the time when final stats are requested
+    if "end_time" not in game_state:
+        game_state["end_time"] = time.time()
     
-    # Storing logic goes here
+    # Calculate stats using frozen time
+    final_level = game_state["current_level"]
+    total_time_seconds = game_state["end_time"] - game_state["start_time"]
+    
+    # Format time as MM:SS
+    minutes = int(total_time_seconds // 60)
+    seconds = int(total_time_seconds % 60)
+    formatted_time = f"{minutes}:{seconds:02d}"
+    
+    return {
+        "final_level": final_level,
+        "time": formatted_time
+    }
+
+@router.post("/submit-score")
+async def submit_score(data: dict):
+    run_id = data.get("run_id")
+    username = data.get("username")
+    email = data.get("email")
+    
+    if run_id not in ACTIVE_RUNS:
+        raise HTTPException(status_code=404, detail="Run not found")
+    
+    game_state = ACTIVE_RUNS[run_id]
+    
+    # Use the frozen end_time if it exists, otherwise freeze it now
+    if "end_time" not in game_state:
+        game_state["end_time"] = time.time()
+    
+    # Calculate final score using frozen time
+    final_level = game_state["current_level"]
+    total_time_seconds = game_state["end_time"] - game_state["start_time"]
+    
+    # Format time as MM:SS
+    minutes = int(total_time_seconds // 60)
+    seconds = int(total_time_seconds % 60)
+    formatted_time = f"{minutes}:{seconds:02d}"
+    
+    # Store in database/leaderboard here
+    score_data = {
+        "username": username,
+        "stage_reached": final_level,
+        "time": formatted_time,
+        "date_submitted": time.time()
+    }
+    
+    # Store email separately if provided
+    if email:
+        contact_data = {
+            "username": username,
+            "email": email,
+            "submission_date": time.time()
+        }
     
     # Clean up run
     del ACTIVE_RUNS[run_id]
     
     return {
-        "message": "Score submitted",
+        "message": "Score submitted successfully",
         "final_level": final_level,
-        "time": total_time,
+        "time": formatted_time,
         "username": username
     }
