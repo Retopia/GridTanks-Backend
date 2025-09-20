@@ -232,6 +232,16 @@ async def submit_score(data: dict, db: AsyncSession = Depends(get_db)):
     username = data.get("username")
     email = data.get("email")
     
+    # Input validation
+    if not username:
+        raise HTTPException(status_code=400, detail="Username is required")
+    
+    if len(username) > 20:
+        raise HTTPException(status_code=400, detail="Username must be 20 characters or less")
+    
+    if email and len(email) > 255:
+        raise HTTPException(status_code=400, detail="Email must be 255 characters or less")
+    
     if run_id not in ACTIVE_RUNS:
         raise HTTPException(status_code=404, detail="Run not found")
     
