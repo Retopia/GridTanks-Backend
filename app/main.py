@@ -13,6 +13,7 @@ is_development = os.getenv("ENVIRONMENT") == "development"
 
 origins = [
     "http://localhost:5173",
+    "http://localhost:4173",
     "http://localhost:3000", 
 ] if is_development else [
     "https://gridtanks.net",

@@ -268,7 +268,7 @@ async def submit_score(data: dict, db: AsyncSession = Depends(get_db)):
     # Create leaderboard entry
     leaderboard_entry = LeaderboardEntry(
         username=username,
-        completed_stages=completed_levels,
+        completed_levels=completed_levels,
         time_seconds=total_time_seconds,
         formatted_time=formatted_time
     )
@@ -290,7 +290,7 @@ async def submit_score(data: dict, db: AsyncSession = Depends(get_db)):
     
     return {
         "message": "Score submitted successfully",
-        "final_level": final_level,
+        "final_level": completed_levels,
         "time": formatted_time,
         "username": username
     }
@@ -305,7 +305,7 @@ async def get_leaderboard(
         
         # Order by stage (desc), then by time (asc) for same stage
         query = select(LeaderboardEntry).order_by(
-            desc(LeaderboardEntry.stage_reached),
+            desc(LeaderboardEntry.completed_levels),
             LeaderboardEntry.time_seconds.asc()
         ).offset(offset).limit(limit)
         
@@ -316,7 +316,7 @@ async def get_leaderboard(
             "entries": [
                 {
                     "username": entry.username,
-                    "stage_reached": entry.stage_reached,
+                    "completed_levels": entry.completed_levels,
                     "time": entry.formatted_time,
                     "date_submitted": entry.date_submitted.strftime("%m/%d/%Y")
                 }
