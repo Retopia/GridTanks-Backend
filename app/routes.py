@@ -25,10 +25,11 @@ MAPS_DIR = BASE_DIR / "maps"
 TANK_TYPES = {
     3: "player",   # Player Tank - Speed: 2, Bullets: 5, Type: Normal
     4: "brown",    # Brown Tank - Speed: 0, Bullets: 1, Type: Normal
-    5: "grey",     # Grey Tank - Speed: 1, Bullets: 1, Type: Normal
+    5: "grey",     # Grey Tank - Speed: 1, Bullets: 2, Type: Normal
     6: "green",    # Green Tank - Speed: 1, Bullets: 1, Type: Fire
     7: "pink",     # Pink Tank - Speed: 2, Bullets: 5, Type: Normal
     8: "black",    # Black Tank - Speed: 3, Bullets: 5, Type: Fire
+    9: "red",      # Red Tank - Speed: 3, Bullets: 5, Type: Both
 }
 
 ACTIVE_RUNS: Dict[str, Dict] = {}  # run_id -> game_state
