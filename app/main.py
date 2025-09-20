@@ -26,7 +26,16 @@ async def lifespan(app: FastAPI):
     await create_tables()
     yield
 
-app = FastAPI(title="GridTanks API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="GridTanks API", 
+    version="1.0.0", 
+    lifespan=lifespan,
+    # Disable docs in production
+    docs_url="/docs" if is_development else None,
+    redoc_url="/redoc" if is_development else None,
+    openapi_url="/openapi.json" if is_development else None
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
