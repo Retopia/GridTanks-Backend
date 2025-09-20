@@ -10,14 +10,14 @@ class LeaderboardEntry(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(20), nullable=False, index=True)
-    stage_reached = Column(Integer, nullable=False)
+    completed_levels = Column(Integer, nullable=False)
     time_seconds = Column(Integer, nullable=False)  # Store as seconds for sorting
     formatted_time = Column(String(10), nullable=False)  # Display format like "12:47"
     date_submitted = Column(DateTime, default=func.now(), nullable=False, index=True)
     
     # Add composite index for leaderboard queries
     __table_args__ = (
-        Index('idx_leaderboard_ranking', 'stage_reached', 'time_seconds'),
+        Index('idx_leaderboard_ranking', 'completed_levels', 'time_seconds'),
     )
 
 class ContactInfo(Base):

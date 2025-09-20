@@ -213,7 +213,8 @@ async def get_final_stats(data: dict):
         game_state["end_time"] = time.time()
     
     # Calculate stats using frozen time
-    final_level = game_state["current_level"]
+    current_level = game_state["current_level"]
+    completed_levels = len(game_state["completed_levels"])
     total_time_seconds = game_state["end_time"] - game_state["start_time"]
     
     # Format time as MM:SS
@@ -221,8 +222,13 @@ async def get_final_stats(data: dict):
     seconds = int(total_time_seconds % 60)
     formatted_time = f"{minutes}:{seconds:02d}"
     
+    # Determine completion status
+    next_map_file = MAPS_DIR / f"level_{current_level + 1}.txt"
+    game_complete = not next_map_file.exists() and current_level in game_state["completed_levels"]
+    
     return {
-        "final_level": final_level,
+        "stages_completed": completed_levels,
+        "game_complete": game_complete,
         "time": formatted_time
     }
 
@@ -251,7 +257,7 @@ async def submit_score(data: dict, db: AsyncSession = Depends(get_db)):
     if "end_time" not in game_state:
         game_state["end_time"] = time.time()
     
-    final_level = game_state["current_level"]
+    completed_levels = len(game_state["completed_levels"])
     total_time_seconds = int(game_state["end_time"] - game_state["start_time"])
     
     # Format time as MM:SS
@@ -262,7 +268,7 @@ async def submit_score(data: dict, db: AsyncSession = Depends(get_db)):
     # Create leaderboard entry
     leaderboard_entry = LeaderboardEntry(
         username=username,
-        stage_reached=final_level,
+        completed_stages=completed_levels,
         time_seconds=total_time_seconds,
         formatted_time=formatted_time
     )
