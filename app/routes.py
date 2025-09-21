@@ -107,6 +107,7 @@ async def start_game():
         "tanks_eliminated": {},  # level -> {tank_type: count}
         "total_eliminated": 0,
         "start_time": time.time(),
+        "deaths": 0,
         "completed_levels": []
     }
     
@@ -123,6 +124,7 @@ async def game_event(data: dict):
     
     if TANK_TYPES[tank_type] == "player":
       logger.info(f"{run_id} was eliminated")
+      game_state["deaths"] += 1
       
       # Reset tank eliminations for current level
       if current_level in game_state["tanks_eliminated"]:
@@ -260,6 +262,7 @@ async def submit_score(data: dict, db: AsyncSession = Depends(get_db)):
     
     completed_levels = len(game_state["completed_levels"])
     total_time_seconds = int(game_state["end_time"] - game_state["start_time"])
+    deaths = game_state["deaths"]
     
     # Format time as MM:SS
     minutes = total_time_seconds // 60
@@ -271,7 +274,8 @@ async def submit_score(data: dict, db: AsyncSession = Depends(get_db)):
         username=username,
         completed_levels=completed_levels,
         time_seconds=total_time_seconds,
-        formatted_time=formatted_time
+        formatted_time=formatted_time,
+        deaths = deaths
     )
     
     db.add(leaderboard_entry)

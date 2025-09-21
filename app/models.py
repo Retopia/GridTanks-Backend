@@ -1,7 +1,6 @@
-from sqlalchemy import Column, Integer, String, DateTime, Float, Boolean, Index, UniqueConstraint
+from sqlalchemy import Column, Integer, String, DateTime, Index, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
-from datetime import datetime
 
 Base = declarative_base()
 
@@ -13,6 +12,7 @@ class LeaderboardEntry(Base):
     completed_levels = Column(Integer, nullable=False)
     time_seconds = Column(Integer, nullable=False)  # Store as seconds for sorting
     formatted_time = Column(String(10), nullable=False)  # Display format like "12:47"
+    deaths = Column(Integer, nullable=False) # Just fun to keep track of, not used in ranking
     date_submitted = Column(DateTime, default=func.now(), nullable=False, index=True)
     
     # Add composite index for leaderboard queries
