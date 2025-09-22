@@ -145,7 +145,8 @@ async def game_event(data: dict):
       
       level_info = LEVEL_METADATA[current_level]
       if tank_type not in level_info["enemy_tank_types"]:
-          raise HTTPException(status_code=400, detail="Invalid tank type for current level")
+          del ACTIVE_RUNS[run_id]
+          raise HTTPException(status_code=400, detail="Run invalidated - Invalid tank type for current level")
       
       # Track elimination
       if current_level not in game_state["tanks_eliminated"]:
@@ -156,7 +157,8 @@ async def game_event(data: dict):
       
       # Check if player eliminated more tanks than exist
       if level_eliminations[tank_type] > level_info["enemy_tank_types"][tank_type]:
-          raise HTTPException(status_code=400, detail="Too many tanks eliminated")
+          del ACTIVE_RUNS[run_id]
+          raise HTTPException(status_code=400, detail="Run invalidated - Too many tanks eliminated")
       
       # Check if level is complete
       total_eliminated_this_level = sum(level_eliminations.values())
