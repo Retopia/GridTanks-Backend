@@ -27,8 +27,3 @@ class ContactInfo(Base):
     username = Column(String(20), nullable=False, index=True)
     email = Column(String(255), nullable=False)
     submission_date = Column(DateTime, default=func.now(), nullable=False)
-    
-    # Prevent duplicate emails per username
-    __table_args__ = (
-        UniqueConstraint('username', 'email', name='uq_username_email'),
-    )
