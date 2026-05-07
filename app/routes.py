@@ -527,6 +527,13 @@ async def start_game(data: dict | None = Body(default=None)):
 async def game_event(data: dict):
     run_id = data.get("run_id") # str
     tank_type = data.get("tank_type") # int
+
+    if run_id not in ACTIVE_RUNS:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if tank_type not in TANK_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid tank type")
+
     game_state = ACTIVE_RUNS[run_id]
     current_level = game_state["current_level"]
     
@@ -544,9 +551,6 @@ async def game_event(data: dict):
           "current_level": current_level
       }
     else:
-      if run_id not in ACTIVE_RUNS:
-          raise HTTPException(status_code=404, detail="Run not found")
-      
       # Validate level exists and tank type is valid
       if current_level not in LEVEL_METADATA:
           raise HTTPException(status_code=400, detail="Invalid level")
