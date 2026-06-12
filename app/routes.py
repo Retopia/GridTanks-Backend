@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 
 from .database import get_db
-from .models import LeaderboardEntry, CoopLeaderboardEntry, ContactInfo
+from .models import LeaderboardEntry, CoopLeaderboardEntry, EndlessLeaderboardEntry, ContactInfo
 
 
 router = APIRouter()
@@ -69,10 +69,17 @@ def sanitize_display_name(display_name, fallback):
     return cleaned[:20]
 
 
+LEADERBOARD_MODELS = {
+    "solo": LeaderboardEntry,
+    "coop": CoopLeaderboardEntry,
+    "endless": EndlessLeaderboardEntry,
+}
+
+
 def normalize_run_mode(raw_mode):
     mode = str(raw_mode or "solo").strip().lower()
-    if mode == "coop":
-        return "coop"
+    if mode in LEADERBOARD_MODELS:
+        return mode
     return "solo"
 
 
@@ -237,6 +244,275 @@ def preprocess_levels():
 
 # Call on startup
 preprocess_levels()
+
+# --- Endless mode ---
+# Waves are fully procedurally generated: a fresh wall layout every wave,
+# plus an enemy set whose difficulty scales with the wave number.
+
+# How many "difficulty points" each tank type costs to spawn.
+ENDLESS_TANK_COSTS = {4: 1, 5: 2, 6: 3, 7: 4, 8: 5, 9: 6}
+# Wave at which each tank type starts appearing.
+ENDLESS_TANK_UNLOCK_WAVE = {4: 1, 5: 2, 6: 4, 7: 6, 8: 8, 9: 10}
+# Hard cap so late waves stay playable (and performant). Below the cap the
+# picker always spends the full wave budget (browns cost 1 and are always
+# unlocked), so every wave is strictly harder until all-red saturation at
+# 16 * 6 = 96 points (~wave 95).
+ENDLESS_MAX_TANKS = 16
+# Minimum distance (in cells) between the player spawn and enemy spawns.
+ENDLESS_MIN_SPAWN_DISTANCE = 8
+# Minimum distance (in cells) between any two enemy spawns.
+ENDLESS_MIN_TANK_SPACING = 3
+
+# Procedural map parameters (must match the frontend's 40x30 grid of 20px cells).
+ENDLESS_MAP_ROWS = 30
+ENDLESS_MAP_COLS = 40
+ENDLESS_CELL_SIZE = 20
+# Every corridor must be at least this many open cells wide.
+ENDLESS_MIN_GAP = 3
+
+
+def endless_wave_budget(wave):
+    # Gentle ramp: wave 1 is one or two weak tanks, roughly +1 point per wave.
+    return 1 + wave
+
+
+def pick_endless_tanks(wave):
+    """Spend the wave's difficulty budget on a random mix of tank types,
+    weighted toward stronger tanks so later waves skew dangerous."""
+    budget = endless_wave_budget(wave)
+    available = [t for t, unlock in ENDLESS_TANK_UNLOCK_WAVE.items() if wave >= unlock]
+
+    counts = {}
+    total = 0
+    while budget > 0 and total < ENDLESS_MAX_TANKS:
+        affordable = [t for t in available if ENDLESS_TANK_COSTS[t] <= budget]
+        if not affordable:
+            break
+        tank_type = random.choices(
+            affordable,
+            weights=[ENDLESS_TANK_COSTS[t] for t in affordable]
+        )[0]
+        counts[tank_type] = counts.get(tank_type, 0) + 1
+        budget -= ENDLESS_TANK_COSTS[tank_type]
+        total += 1
+
+    if not counts:
+        counts = {4: 1}
+
+    return counts
+
+
+def is_clear_of_obstacles(grid, cell, radius=1):
+    """True if no wall/hole cell lies within `radius` cells (Chebyshev) of
+    `cell` — used to keep spawn points from touching walls."""
+    rows = len(grid)
+    cols = len(grid[0])
+    r0, c0 = cell
+    for r in range(r0 - radius, r0 + radius + 1):
+        for c in range(c0 - radius, c0 + radius + 1):
+            if r < 0 or r >= rows or c < 0 or c >= cols:
+                return False
+            if grid[r][c] in ("1", "2"):
+                return False
+    return True
+
+
+def has_line_of_sight(grid, start, end):
+    """Bresenham walk between two cells; walls ("1") block sight."""
+    r0, c0 = start
+    r1, c1 = end
+    dr = abs(r1 - r0)
+    dc = abs(c1 - c0)
+    sr = 1 if r0 < r1 else -1
+    sc = 1 if c0 < c1 else -1
+    err = dc - dr
+    r, c = r0, c0
+
+    while True:
+        if grid[r][c] == "1":
+            return False
+        if r == r1 and c == c1:
+            return True
+        e2 = 2 * err
+        if e2 > -dr:
+            err -= dr
+            c += sc
+        if e2 < dc:
+            err += dc
+            r += sr
+
+
+def generate_endless_map():
+    """Generate a random arena: bordered grid with scattered wall/hole bars.
+
+    Every bar is placed with ENDLESS_MIN_GAP cells of clearance from all other
+    obstacles (border included), so corridors are always at least 3 cells wide.
+    Because bars never touch each other, they can't enclose a region — the map
+    is always fully connected. Returns (grid, collision_lines, player_pos).
+    """
+    rows, cols = ENDLESS_MAP_ROWS, ENDLESS_MAP_COLS
+    grid = [["0"] * cols for _ in range(rows)]
+    for c in range(cols):
+        grid[0][c] = "1"
+        grid[rows - 1][c] = "1"
+    for r in range(rows):
+        grid[r][0] = "1"
+        grid[r][cols - 1] = "1"
+
+    def area_clear(r0, c0, r1, c1, pad):
+        for r in range(max(0, r0 - pad), min(rows, r1 + pad + 1)):
+            for c in range(max(0, c0 - pad), min(cols, c1 + pad + 1)):
+                if grid[r][c] != "0":
+                    return False
+        return True
+
+    wall_rects = []
+    target_segments = random.randint(6, 10)
+    placed = 0
+    attempts = 0
+    while placed < target_segments and attempts < 400:
+        attempts += 1
+        length = random.randint(4, 12)
+        if random.random() < 0.5:
+            height, width = 1, length
+        else:
+            height, width = length, 1
+
+        r0 = random.randint(1, rows - 1 - height)
+        c0 = random.randint(1, cols - 1 - width)
+        r1, c1 = r0 + height - 1, c0 + width - 1
+
+        if not area_clear(r0, c0, r1, c1, ENDLESS_MIN_GAP):
+            continue
+
+        is_hole = random.random() < 0.15
+        fill = "2" if is_hole else "1"
+        for r in range(r0, r1 + 1):
+            for c in range(c0, c1 + 1):
+                grid[r][c] = fill
+        if not is_hole:
+            # Holes don't block bullets, so only walls get collision lines.
+            wall_rects.append((r0, c0, r1, c1))
+        placed += 1
+
+    cs = ENDLESS_CELL_SIZE
+    collision_lines = [
+        (cs, cs, (cols - 1) * cs, cs),
+        (cs, (rows - 1) * cs, (cols - 1) * cs, (rows - 1) * cs),
+        (cs, cs, cs, (rows - 1) * cs),
+        ((cols - 1) * cs, cs, (cols - 1) * cs, (rows - 1) * cs),
+    ]
+    for r0, c0, r1, c1 in wall_rects:
+        x0, y0 = c0 * cs, r0 * cs
+        x1, y1 = (c1 + 1) * cs, (r1 + 1) * cs
+        collision_lines.extend([
+            (x0, y0, x1, y0),
+            (x0, y1, x1, y1),
+            (x0, y0, x0, y1),
+            (x1, y0, x1, y1),
+        ])
+
+    spawn_candidates = [
+        (r, c)
+        for r in range(2, rows - 2)
+        for c in range(2, cols - 2)
+        if grid[r][c] == "0" and is_clear_of_obstacles(grid, (r, c))
+    ]
+    player_pos = random.choice(spawn_candidates)
+    grid[player_pos[0]][player_pos[1]] = "3"
+
+    return grid, collision_lines, player_pos
+
+
+def generate_endless_wave(wave):
+    """Build a wave: a fresh procedural arena + procedurally placed enemies.
+    Returns (map_text, tank_counts)."""
+    grid, collision_lines, player_pos = generate_endless_map()
+    lines_section = "\n".join(
+        " ".join(str(v) for v in line) for line in collision_lines
+    )
+
+    tank_counts = pick_endless_tanks(wave)
+    total_tanks = sum(tank_counts.values())
+
+    open_cells = [
+        (r, c)
+        for r, row in enumerate(grid)
+        for c, cell in enumerate(row)
+        if cell == "0" and is_clear_of_obstacles(grid, (r, c))
+    ]
+    if len(open_cells) < total_tanks:
+        # Defensive fallback — with the 3-cell gap rule there are always
+        # hundreds of clear cells, but never fail outright.
+        open_cells = [
+            (r, c)
+            for r, row in enumerate(grid)
+            for c, cell in enumerate(row)
+            if cell == "0"
+        ]
+
+    def far_enough(cell, min_distance):
+        dr = cell[0] - player_pos[0]
+        dc = cell[1] - player_pos[1]
+        return (dr * dr + dc * dc) >= min_distance * min_distance
+
+    spawn_cells = [cell for cell in open_cells if far_enough(cell, ENDLESS_MIN_SPAWN_DISTANCE)]
+    if len(spawn_cells) < total_tanks:
+        spawn_cells = [cell for cell in open_cells if far_enough(cell, 4)]
+    if len(spawn_cells) < total_tanks:
+        spawn_cells = open_cells
+
+    # Prefer cells the player spawn can't be shot from directly, so waves
+    # never open with an immediate snipe. Fall back to sighted cells only if
+    # the map doesn't have enough cover.
+    covered = [cell for cell in spawn_cells if not has_line_of_sight(grid, cell, player_pos)]
+    sighted = [cell for cell in spawn_cells if cell not in set(covered)]
+    random.shuffle(covered)
+    random.shuffle(sighted)
+    spawn_pool = covered + sighted
+
+    # Greedily pick spawns so no two tanks start within
+    # ENDLESS_MIN_TANK_SPACING cells of each other.
+    min_spacing_sq = ENDLESS_MIN_TANK_SPACING * ENDLESS_MIN_TANK_SPACING
+
+    def spaced_from_chosen(cell, chosen):
+        return all(
+            (cell[0] - other[0]) ** 2 + (cell[1] - other[1]) ** 2 >= min_spacing_sq
+            for other in chosen
+        )
+
+    chosen_cells = []
+    for cell in spawn_pool:
+        if len(chosen_cells) == total_tanks:
+            break
+        if spaced_from_chosen(cell, chosen_cells):
+            chosen_cells.append(cell)
+
+    if len(chosen_cells) < total_tanks:
+        # Not enough spaced cells (shouldn't happen on a 40x30 grid) —
+        # relax the spacing rather than under-spawn the wave.
+        chosen_set = set(chosen_cells)
+        for cell in spawn_pool:
+            if len(chosen_cells) == total_tanks:
+                break
+            if cell not in chosen_set:
+                chosen_cells.append(cell)
+                chosen_set.add(cell)
+
+    placed_counts = {}
+    cell_iter = iter(chosen_cells)
+    for tank_type, count in tank_counts.items():
+        for _ in range(count):
+            cell = next(cell_iter, None)
+            if cell is None:
+                break
+            grid[cell[0]][cell[1]] = str(tank_type)
+            placed_counts[tank_type] = placed_counts.get(tank_type, 0) + 1
+
+    map_text = "\n".join(" ".join(row) for row in grid)
+    map_text += "\n\n" + lines_section
+
+    return map_text, placed_counts
 
 @router.get("/health")
 async def health_check():
@@ -508,20 +784,90 @@ async def start_game(data: dict | None = Body(default=None)):
 
     run_mode = normalize_run_mode((data or {}).get("mode"))
     run_id = str(uuid4())
-    
+
+    # TEMP FOR TESTING: start endless runs at wave 40. Revert to 1 before release!
+    starting_level = 1 if run_mode == "endless" else 1
+
     ACTIVE_RUNS[run_id] = {
-        "current_level": 1,
+        "current_level": starting_level,
         "tanks_eliminated": {},  # level -> {tank_type: count}
         "total_eliminated": 0,
         "start_time": time.time(),
         "deaths": 0,
         "completed_levels": [],
-        "mode": run_mode
+        "mode": run_mode,
+        # Endless-only state: the current wave's generated map and the enemy
+        # counts used to validate eliminations server-side.
+        "ended": False,
+        "endless_wave_map": None,
+        "endless_wave_counts": None
     }
     
     logger.info(f"Created new run with ID: {run_id}")
     
-    return {"run_id": run_id, "message": "Game started", "level": 1, "mode": run_mode}
+    return {"run_id": run_id, "message": "Game started", "level": starting_level, "mode": run_mode}
+
+def handle_endless_game_event(run_id, game_state, tank_type):
+    current_wave = game_state["current_level"]
+
+    if game_state.get("ended"):
+        return {"message": "Run already over", "game_complete": True}
+
+    if TANK_TYPES[tank_type] == "player":
+        # Endless is one life: dying ends the run.
+        logger.info(f"{run_id} endless run over at wave {current_wave}")
+        game_state["deaths"] += 1
+        game_state["ended"] = True
+        game_state["end_time"] = time.time()
+
+        return {
+            "message": "Run over - you were eliminated",
+            "game_complete": True,
+            "waves_completed": len(game_state["completed_levels"])
+        }
+
+    wave_counts = game_state.get("endless_wave_counts")
+    if not wave_counts:
+        raise HTTPException(status_code=400, detail="No active wave")
+
+    if tank_type not in wave_counts:
+        del ACTIVE_RUNS[run_id]
+        raise HTTPException(status_code=400, detail="Run invalidated - Invalid tank type for current wave")
+
+    if current_wave not in game_state["tanks_eliminated"]:
+        game_state["tanks_eliminated"][current_wave] = {}
+
+    wave_eliminations = game_state["tanks_eliminated"][current_wave]
+    wave_eliminations[tank_type] = wave_eliminations.get(tank_type, 0) + 1
+
+    if wave_eliminations[tank_type] > wave_counts[tank_type]:
+        del ACTIVE_RUNS[run_id]
+        raise HTTPException(status_code=400, detail="Run invalidated - Too many tanks eliminated")
+
+    total_eliminated = sum(wave_eliminations.values())
+    total_in_wave = sum(wave_counts.values())
+    wave_complete = total_eliminated == total_in_wave
+
+    logger.info(f"{run_id} endless wave {current_wave}: eliminated tank {tank_type} - {total_eliminated} of {total_in_wave}")
+
+    response = {
+        "message": "Tank elimination recorded",
+        "tank_type": tank_type,
+        "level_complete": wave_complete
+    }
+
+    if wave_complete:
+        game_state["completed_levels"].append(current_wave)
+        next_wave = current_wave + 1
+        game_state["current_level"] = next_wave
+        # Clear the cached wave so the next /level call generates a new one.
+        game_state["endless_wave_map"] = None
+        game_state["endless_wave_counts"] = None
+        response["next_level"] = next_wave
+        response["message"] = "Wave cleared! Advancing to next wave."
+
+    return response
+
 
 @router.post("/game-event")
 async def game_event(data: dict):
@@ -536,7 +882,10 @@ async def game_event(data: dict):
 
     game_state = ACTIVE_RUNS[run_id]
     current_level = game_state["current_level"]
-    
+
+    if game_state.get("mode") == "endless":
+        return handle_endless_game_event(run_id, game_state, tank_type)
+
     if TANK_TYPES[tank_type] == "player":
       logger.info(f"{run_id} was eliminated")
       game_state["deaths"] += 1
@@ -609,11 +958,23 @@ async def get_current_level(data: dict):
     
     game_state = ACTIVE_RUNS[run_id]
     current_level = game_state["current_level"]
-    
+
+    if game_state.get("mode") == "endless":
+        if game_state.get("ended"):
+            return {"game_complete": True, "final_level": len(game_state["completed_levels"])}
+
+        # Generate the wave once and cache it so retries get the same layout.
+        if not game_state.get("endless_wave_map"):
+            map_text, tank_counts = generate_endless_wave(current_level)
+            game_state["endless_wave_map"] = map_text
+            game_state["endless_wave_counts"] = tank_counts
+
+        return PlainTextResponse(game_state["endless_wave_map"])
+
     map_file = MAPS_DIR / f"level_{current_level}.txt"
     if not map_file.exists():
         return {"game_complete": True, "final_level": current_level - 1}
-    
+
     return PlainTextResponse(map_file.read_text())
 
 @router.post("/get-final-stats")
@@ -639,10 +1000,13 @@ async def get_final_stats(data: dict):
     seconds = int(total_time_seconds % 60)
     formatted_time = f"{minutes}:{seconds:02d}"
     
-    # Determine completion status
-    next_map_file = MAPS_DIR / f"level_{current_level + 1}.txt"
-    game_complete = not next_map_file.exists() and current_level in game_state["completed_levels"]
-    
+    # Determine completion status (endless runs never "complete" the game)
+    if game_state.get("mode") == "endless":
+        game_complete = False
+    else:
+        next_map_file = MAPS_DIR / f"level_{current_level + 1}.txt"
+        game_complete = not next_map_file.exists() and current_level in game_state["completed_levels"]
+
     return {
         "stages_completed": completed_levels,
         "game_complete": game_complete,
@@ -684,7 +1048,7 @@ async def submit_score(data: dict, db: AsyncSession = Depends(get_db)):
     seconds = total_time_seconds % 60
     formatted_time = f"{minutes}:{seconds:02d}"
     
-    leaderboard_model = CoopLeaderboardEntry if run_mode == "coop" else LeaderboardEntry
+    leaderboard_model = LEADERBOARD_MODELS[run_mode]
 
     leaderboard_entry = leaderboard_model(
         username=username,
@@ -726,7 +1090,7 @@ async def get_leaderboard(
     ):
         offset = (page - 1) * limit
         run_mode = normalize_run_mode(mode)
-        leaderboard_model = CoopLeaderboardEntry if run_mode == "coop" else LeaderboardEntry
+        leaderboard_model = LEADERBOARD_MODELS[run_mode]
         
         # Order by stage (desc), then by time (asc) for same stage
         query = select(leaderboard_model).order_by(
