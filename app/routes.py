@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 
 from .database import get_db
-from .models import LeaderboardEntry, CoopLeaderboardEntry, EndlessLeaderboardEntry, ContactInfo
+from .models import LeaderboardEntry, CoopLeaderboardEntry, EndlessLeaderboardEntry, CoopEndlessLeaderboardEntry, ContactInfo
 
 
 router = APIRouter()
@@ -134,6 +134,7 @@ LEADERBOARD_MODELS = {
     "solo": LeaderboardEntry,
     "coop": CoopLeaderboardEntry,
     "endless": EndlessLeaderboardEntry,
+    "coop_endless": CoopEndlessLeaderboardEntry,
 }
 
 
@@ -142,6 +143,14 @@ def normalize_run_mode(raw_mode):
     if mode in LEADERBOARD_MODELS:
         return mode
     return "solo"
+
+
+def is_endless_mode(mode):
+    return mode in ("endless", "coop_endless")
+
+
+def is_coop_mode(mode):
+    return mode in ("coop", "coop_endless")
 
 
 def leaderboard_name_key(username):
@@ -198,9 +207,12 @@ def serialize_room_state(room):
     both_connected = host_connected and guest_connected
     both_ready = host_ready and guest_ready
 
+    run_mode = ACTIVE_RUNS.get(room.get("run_id"), {}).get("mode")
+
     return {
         "room_code": room["room_code"],
         "run_id": room.get("run_id"),
+        "mode": run_mode,
         "game_started": room["game_started"],
         "host": {
             "name": host["name"],
@@ -767,7 +779,9 @@ async def room_socket(websocket: WebSocket, room_code: str, token: str):
                 if active_run is None:
                     await send_ws_error(websocket, "Run not found. Create a new run and try again.")
                     continue
-                active_run["mode"] = "coop"
+                # Preserve an endless co-op run; otherwise mark it a co-op run.
+                if not is_coop_mode(active_run.get("mode")):
+                    active_run["mode"] = "coop"
 
                 host = latest_room["host"]
                 guest = latest_room.get("guest")
@@ -993,7 +1007,7 @@ async def game_event(data: GameEventRequest):
     game_state = ACTIVE_RUNS[run_id]
     current_level = game_state["current_level"]
 
-    if game_state.get("mode") == "endless":
+    if is_endless_mode(game_state.get("mode")):
         return handle_endless_game_event(run_id, game_state, tank_type)
 
     if TANK_TYPES[tank_type] == "player":
@@ -1075,7 +1089,7 @@ async def get_current_level(data: RunRequest):
     game_state = ACTIVE_RUNS[run_id]
     current_level = game_state["current_level"]
 
-    if game_state.get("mode") == "endless":
+    if is_endless_mode(game_state.get("mode")):
         if game_state.get("ended"):
             return {"game_complete": True, "final_level": len(game_state["completed_levels"])}
 
@@ -1117,7 +1131,7 @@ async def get_final_stats(data: RunRequest):
     formatted_time = f"{minutes}:{seconds:02d}"
     
     # Determine completion status (endless runs never "complete" the game)
-    if game_state.get("mode") == "endless":
+    if is_endless_mode(game_state.get("mode")):
         game_complete = False
     else:
         next_map_file = MAPS_DIR / f"level_{current_level + 1}.txt"

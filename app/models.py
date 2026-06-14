@@ -50,6 +50,21 @@ class EndlessLeaderboardEntry(Base):
         Index('idx_endless_leaderboard_ranking', 'completed_levels', 'time_seconds'),
     )
 
+class CoopEndlessLeaderboardEntry(Base):
+    __tablename__ = "coop_endless_leaderboard"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(20), nullable=False, index=True)
+    completed_levels = Column(Integer, nullable=False)  # Waves survived
+    time_seconds = Column(Integer, nullable=False)
+    formatted_time = Column(String(10), nullable=False)
+    deaths = Column(Integer, nullable=False)
+    date_submitted = Column(DateTime, default=func.now(), nullable=False, index=True)
+
+    __table_args__ = (
+        Index('idx_coop_endless_leaderboard_ranking', 'completed_levels', 'time_seconds'),
+    )
+
 class ContactInfo(Base):
     __tablename__ = "contact_info"
     
