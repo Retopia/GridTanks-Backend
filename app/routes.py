@@ -9,6 +9,7 @@ from fastapi.responses import PlainTextResponse
 from pathlib import Path
 from typing import Dict
 from uuid import uuid4
+from pydantic import BaseModel, Field, field_validator
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
@@ -40,6 +41,66 @@ LEVEL_METADATA: Dict[int, Dict] = {}
 ROOM_CODE_CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 ROOM_CODE_LENGTH = 6
 ROOM_TTL_SECONDS = 60 * 60 * 2
+CLEARED_TRANSITION_PAUSE_MS = 1333
+FAILED_TRANSITION_PAUSE_MS = 1167
+
+
+class RoomCreateRequest(BaseModel):
+    display_name: str | None = Field(default=None, max_length=20)
+
+    @field_validator("display_name")
+    @classmethod
+    def clean_display_name(cls, value):
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
+
+class RoomJoinRequest(RoomCreateRequest):
+    room_code: str = Field(min_length=1, max_length=32)
+
+
+class StartGameRequest(BaseModel):
+    mode: str = Field(default="solo", max_length=20)
+
+
+class RunRequest(BaseModel):
+    run_id: str = Field(min_length=1)
+
+    @field_validator("run_id")
+    @classmethod
+    def clean_run_id(cls, value):
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Run ID is required")
+        return cleaned
+
+
+class GameEventRequest(RunRequest):
+    tank_type: int
+
+
+class SubmitScoreRequest(RunRequest):
+    username: str = Field(min_length=1, max_length=20)
+    email: str | None = Field(default=None, max_length=255)
+    mode: str = Field(default="solo", max_length=20)
+
+    @field_validator("username")
+    @classmethod
+    def clean_username(cls, value):
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Username is required")
+        return cleaned
+
+    @field_validator("email")
+    @classmethod
+    def clean_email(cls, value):
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
 
 
 def cleanup_old_rooms():
@@ -81,6 +142,29 @@ def normalize_run_mode(raw_mode):
     if mode in LEADERBOARD_MODELS:
         return mode
     return "solo"
+
+
+def leaderboard_name_key(username):
+    return str(username or "").strip().lower()
+
+
+def serialize_leaderboard_entry(entry):
+    return {
+        "username": entry.username,
+        "completed_levels": entry.completed_levels,
+        "time": entry.formatted_time,
+        "date_submitted": entry.date_submitted.strftime("%m/%d/%Y")
+    }
+
+
+def add_backend_pause(game_state, pause_ms):
+    game_state["paused_ms"] = int(game_state.get("paused_ms", 0)) + int(pause_ms or 0)
+
+
+def get_elapsed_time_seconds(game_state):
+    paused_seconds = int(game_state.get("paused_ms", 0)) / 1000
+    elapsed_seconds = game_state["end_time"] - game_state["start_time"] - paused_seconds
+    return max(0, elapsed_seconds)
 
 
 def generate_room_code():
@@ -520,10 +604,10 @@ async def health_check():
 
 
 @router.post("/rooms/create")
-async def create_room(data: dict):
+async def create_room(data: RoomCreateRequest):
     cleanup_old_rooms()
 
-    display_name = sanitize_display_name(data.get("display_name"), "Host")
+    display_name = sanitize_display_name(data.display_name, "Host")
 
     room_code = None
     for _ in range(50):
@@ -566,10 +650,10 @@ async def create_room(data: dict):
 
 
 @router.post("/rooms/join")
-async def join_room(data: dict):
+async def join_room(data: RoomJoinRequest):
     cleanup_old_rooms()
 
-    room_code = normalize_room_code(data.get("room_code"))
+    room_code = normalize_room_code(data.room_code)
     if len(room_code) != ROOM_CODE_LENGTH:
         raise HTTPException(status_code=400, detail="Invalid room code")
 
@@ -583,7 +667,7 @@ async def join_room(data: dict):
     if room.get("guest"):
         raise HTTPException(status_code=409, detail="Room is full")
 
-    display_name = sanitize_display_name(data.get("display_name"), "Guest")
+    display_name = sanitize_display_name(data.display_name, "Guest")
     player_token = str(uuid4())
 
     room["guest"] = {
@@ -777,12 +861,12 @@ async def room_socket(websocket: WebSocket, room_code: str, token: str):
         await broadcast_room_state(active_room)
 
 @router.post("/start-game")
-async def start_game(data: dict | None = Body(default=None)):
+async def start_game(data: StartGameRequest | None = Body(default=None)):
     # Clean up old runs occasionally
     if len(ACTIVE_RUNS) > 100:  # Arbitrary threshold
         cleanup_old_runs()
 
-    run_mode = normalize_run_mode((data or {}).get("mode"))
+    run_mode = normalize_run_mode(data.mode if data else None)
     run_id = str(uuid4())
 
     # TEMP FOR TESTING: start endless runs at wave 40. Revert to 1 before release!
@@ -796,6 +880,7 @@ async def start_game(data: dict | None = Body(default=None)):
         "deaths": 0,
         "completed_levels": [],
         "mode": run_mode,
+        "paused_ms": 0,
         # Endless-only state: the current wave's generated map and the enemy
         # counts used to validate eliminations server-side.
         "ended": False,
@@ -811,7 +896,7 @@ def handle_endless_game_event(run_id, game_state, tank_type):
     current_wave = game_state["current_level"]
 
     if game_state.get("ended"):
-        return {"message": "Run already over", "game_complete": True}
+        return {"message": "Run already over", "game_complete": True, "pause_ms": 0}
 
     if TANK_TYPES[tank_type] == "player":
         # Endless is one life: dying ends the run.
@@ -823,6 +908,7 @@ def handle_endless_game_event(run_id, game_state, tank_type):
         return {
             "message": "Run over - you were eliminated",
             "game_complete": True,
+            "pause_ms": FAILED_TRANSITION_PAUSE_MS,
             "waves_completed": len(game_state["completed_levels"])
         }
 
@@ -853,10 +939,12 @@ def handle_endless_game_event(run_id, game_state, tank_type):
     response = {
         "message": "Tank elimination recorded",
         "tank_type": tank_type,
-        "level_complete": wave_complete
+        "level_complete": wave_complete,
+        "pause_ms": 0
     }
 
     if wave_complete:
+        add_backend_pause(game_state, CLEARED_TRANSITION_PAUSE_MS)
         game_state["completed_levels"].append(current_wave)
         next_wave = current_wave + 1
         game_state["current_level"] = next_wave
@@ -865,14 +953,15 @@ def handle_endless_game_event(run_id, game_state, tank_type):
         game_state["endless_wave_counts"] = None
         response["next_level"] = next_wave
         response["message"] = "Wave cleared! Advancing to next wave."
+        response["pause_ms"] = CLEARED_TRANSITION_PAUSE_MS
 
     return response
 
 
 @router.post("/game-event")
-async def game_event(data: dict):
-    run_id = data.get("run_id") # str
-    tank_type = data.get("tank_type") # int
+async def game_event(data: GameEventRequest):
+    run_id = data.run_id
+    tank_type = data.tank_type
 
     if run_id not in ACTIVE_RUNS:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -889,6 +978,7 @@ async def game_event(data: dict):
     if TANK_TYPES[tank_type] == "player":
       logger.info(f"{run_id} was eliminated")
       game_state["deaths"] += 1
+      add_backend_pause(game_state, FAILED_TRANSITION_PAUSE_MS)
       
       # Reset tank eliminations for current level
       if current_level in game_state["tanks_eliminated"]:
@@ -897,7 +987,8 @@ async def game_event(data: dict):
       return {
           "message": "Player eliminated - level reset",
           "level_reset": True,
-          "current_level": current_level
+          "current_level": current_level,
+          "pause_ms": FAILED_TRANSITION_PAUSE_MS
       }
     else:
       # Validate level exists and tank type is valid
@@ -930,10 +1021,12 @@ async def game_event(data: dict):
       response = {
           "message": "Tank elimination recorded",
           "tank_type": tank_type,
-          "level_complete": level_complete
+          "level_complete": level_complete,
+          "pause_ms": 0
       }
       
       if level_complete:
+        add_backend_pause(game_state, CLEARED_TRANSITION_PAUSE_MS)
         game_state["completed_levels"].append(current_level)
         
         # Check if next level exists before incrementing
@@ -944,15 +1037,17 @@ async def game_event(data: dict):
             game_state["current_level"] = next_level
             response["next_level"] = next_level
             response["message"] = "Level complete! Advancing to next level."
+            response["pause_ms"] = CLEARED_TRANSITION_PAUSE_MS
         else:
             response["game_complete"] = True
             response["message"] = "Congratulations! Game completed!"
+            response["pause_ms"] = CLEARED_TRANSITION_PAUSE_MS
 
     return response
 
 @router.post("/level")
-async def get_current_level(data: dict):
-    run_id = data.get("run_id")
+async def get_current_level(data: RunRequest):
+    run_id = data.run_id
     if run_id not in ACTIVE_RUNS:
         raise HTTPException(status_code=404, detail="Run not found")
     
@@ -978,8 +1073,8 @@ async def get_current_level(data: dict):
     return PlainTextResponse(map_file.read_text())
 
 @router.post("/get-final-stats")
-async def get_final_stats(data: dict):
-    run_id = data.get("run_id")
+async def get_final_stats(data: RunRequest):
+    run_id = data.run_id
     
     if run_id not in ACTIVE_RUNS:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -993,7 +1088,7 @@ async def get_final_stats(data: dict):
     # Calculate stats using frozen time
     current_level = game_state["current_level"]
     completed_levels = len(game_state["completed_levels"])
-    total_time_seconds = game_state["end_time"] - game_state["start_time"]
+    total_time_seconds = get_elapsed_time_seconds(game_state)
     
     # Format time as MM:SS
     minutes = int(total_time_seconds // 60)
@@ -1014,33 +1109,23 @@ async def get_final_stats(data: dict):
     }
 
 @router.post("/submit-score")
-async def submit_score(data: dict, db: AsyncSession = Depends(get_db)):
-    run_id = data.get("run_id")
-    username = data.get("username")
-    email = data.get("email")
-    
-    # Input validation
-    if not username:
-        raise HTTPException(status_code=400, detail="Username is required")
-    
-    if len(username) > 20:
-        raise HTTPException(status_code=400, detail="Username must be 20 characters or less")
-    
-    if email and len(email) > 255:
-        raise HTTPException(status_code=400, detail="Email must be 255 characters or less")
+async def submit_score(data: SubmitScoreRequest, db: AsyncSession = Depends(get_db)):
+    run_id = data.run_id
+    username = data.username
+    email = data.email
     
     if run_id not in ACTIVE_RUNS:
         raise HTTPException(status_code=404, detail="Run not found")
     
     game_state = ACTIVE_RUNS[run_id]
-    run_mode = normalize_run_mode(game_state.get("mode") or data.get("mode"))
+    run_mode = normalize_run_mode(game_state.get("mode") or data.mode)
     
     # Use frozen time
     if "end_time" not in game_state:
         game_state["end_time"] = time.time()
     
     completed_levels = len(game_state["completed_levels"])
-    total_time_seconds = int(game_state["end_time"] - game_state["start_time"])
+    total_time_seconds = int(get_elapsed_time_seconds(game_state))
     deaths = game_state["deaths"]
     
     # Format time as MM:SS
@@ -1088,6 +1173,8 @@ async def get_leaderboard(
         mode: str = "solo",
         db: AsyncSession = Depends(get_db)
     ):
+        page = max(page, 1)
+        limit = max(1, min(limit, 100))
         offset = (page - 1) * limit
         run_mode = normalize_run_mode(mode)
         leaderboard_model = LEADERBOARD_MODELS[run_mode]
@@ -1095,23 +1182,39 @@ async def get_leaderboard(
         # Order by stage (desc), then by time (asc) for same stage
         query = select(leaderboard_model).order_by(
             desc(leaderboard_model.completed_levels),
-            leaderboard_model.time_seconds.asc()
-        ).offset(offset).limit(limit)
+            leaderboard_model.time_seconds.asc(),
+            leaderboard_model.date_submitted.asc()
+        )
         
         result = await db.execute(query)
         entries = result.scalars().all()
+        grouped_entries_by_name = {}
+        grouped_entries = []
+
+        for entry in entries:
+            name_key = leaderboard_name_key(entry.username)
+            serialized_entry = serialize_leaderboard_entry(entry)
+
+            if name_key not in grouped_entries_by_name:
+                grouped_entry = {
+                    **serialized_entry,
+                    "entry_count": 0,
+                    "entries": []
+                }
+                grouped_entries_by_name[name_key] = grouped_entry
+                grouped_entries.append(grouped_entry)
+
+            grouped_entry = grouped_entries_by_name[name_key]
+            grouped_entry["entry_count"] += 1
+            grouped_entry["entries"].append(serialized_entry)
+
+        paged_entries = grouped_entries[offset:offset + limit]
         
         return {
-            "entries": [
-                {
-                    "username": entry.username,
-                    "completed_levels": entry.completed_levels,
-                    "time": entry.formatted_time,
-                    "date_submitted": entry.date_submitted.strftime("%m/%d/%Y")
-                }
-                for entry in entries
-            ],
+            "entries": paged_entries,
             "page": page,
             "limit": limit,
+            "total_players": len(grouped_entries),
+            "has_more": offset + limit < len(grouped_entries),
             "mode": run_mode
         }

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Index, UniqueConstraint
+from sqlalchemy import Column, Integer, String, DateTime, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 
