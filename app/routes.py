@@ -810,6 +810,30 @@ async def room_socket(websocket: WebSocket, room_code: str, token: str):
                 await broadcast_room_state(latest_room)
                 continue
 
+            if message_type == "kick_guest":
+                if latest_role != "host":
+                    await send_ws_error(websocket, "Only host can remove the other player.")
+                    continue
+
+                guest = latest_room.get("guest")
+                if not guest:
+                    continue
+
+                guest_socket = guest.get("websocket")
+                # Free the guest slot so a new player can join.
+                latest_room["guest"] = None
+                latest_room["updated_at"] = time.time()
+
+                if guest_socket is not None:
+                    await send_ws_message(guest_socket, {"type": "kicked", "reason": "host_removed"})
+                    try:
+                        await guest_socket.close(code=1000)
+                    except Exception:
+                        pass
+
+                await broadcast_room_state(latest_room)
+                continue
+
             if message_type == "coop_input":
                 if latest_role != "guest":
                     await send_ws_error(websocket, "Only guest can send co-op input.")
@@ -869,11 +893,8 @@ async def start_game(data: StartGameRequest | None = Body(default=None)):
     run_mode = normalize_run_mode(data.mode if data else None)
     run_id = str(uuid4())
 
-    # TEMP FOR TESTING: start endless runs at wave 40. Revert to 1 before release!
-    starting_level = 1 if run_mode == "endless" else 1
-
     ACTIVE_RUNS[run_id] = {
-        "current_level": starting_level,
+        "current_level": 1,
         "tanks_eliminated": {},  # level -> {tank_type: count}
         "total_eliminated": 0,
         "start_time": time.time(),
@@ -890,7 +911,7 @@ async def start_game(data: StartGameRequest | None = Body(default=None)):
     
     logger.info(f"Created new run with ID: {run_id}")
     
-    return {"run_id": run_id, "message": "Game started", "level": starting_level, "mode": run_mode}
+    return {"run_id": run_id, "message": "Game started", "level": 1, "mode": run_mode}
 
 def handle_endless_game_event(run_id, game_state, tank_type):
     current_wave = game_state["current_level"]
