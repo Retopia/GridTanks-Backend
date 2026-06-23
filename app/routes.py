@@ -1,9 +1,10 @@
 import json
 import logging
+import os
 import random
 import time
 
-from fastapi import APIRouter, HTTPException, Depends, WebSocket, WebSocketDisconnect, Body
+from fastapi import APIRouter, HTTPException, Depends, WebSocket, WebSocketDisconnect, Body, Header
 from fastapi.responses import PlainTextResponse
 
 from pathlib import Path
@@ -43,6 +44,9 @@ ROOM_CODE_LENGTH = 6
 ROOM_TTL_SECONDS = 60 * 60 * 2
 CLEARED_TRANSITION_PAUSE_MS = 1333
 FAILED_TRANSITION_PAUSE_MS = 1167
+# "Get Ready" countdown shown at the start of every level. Must match the
+# frontend's COUNTDOWN_MS so the time excluded from the leaderboard agrees.
+COUNTDOWN_PAUSE_MS = 3000
 
 
 class RoomCreateRequest(BaseModel):
@@ -151,6 +155,46 @@ def is_endless_mode(mode):
 
 def is_coop_mode(mode):
     return mode in ("coop", "coop_endless")
+
+
+# --- Admin ---
+# Password gate for the admin page. Set ADMIN_PASSWORD in the environment
+# (.env locally, Coolify env in prod). If it's unset, the admin endpoints are
+# disabled (fail closed) rather than falling back to a guessable default.
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+
+# Tables the admin records viewer can list/delete from.
+ADMIN_TABLES = {
+    "solo": LeaderboardEntry,
+    "coop": CoopLeaderboardEntry,
+    "endless": EndlessLeaderboardEntry,
+    "coop_endless": CoopEndlessLeaderboardEntry,
+    "contacts": ContactInfo,
+}
+
+
+def verify_admin(x_admin_password: str = Header(default="")):
+    if not ADMIN_PASSWORD or x_admin_password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid admin password")
+    return True
+
+
+def serialize_admin_row(table_key, row):
+    if table_key == "contacts":
+        return {
+            "id": row.id,
+            "username": row.username,
+            "email": row.email,
+            "date": row.submission_date.strftime("%m/%d/%Y") if row.submission_date else ""
+        }
+    return {
+        "id": row.id,
+        "username": row.username,
+        "completed_levels": row.completed_levels,
+        "time": row.formatted_time,
+        "deaths": row.deaths,
+        "date": row.date_submitted.strftime("%m/%d/%Y") if row.date_submitted else ""
+    }
 
 
 def leaderboard_name_key(username):
@@ -915,7 +959,8 @@ async def start_game(data: StartGameRequest | None = Body(default=None)):
         "deaths": 0,
         "completed_levels": [],
         "mode": run_mode,
-        "paused_ms": 0,
+        # Seeded with one countdown so level 1's "Get Ready" is excluded too.
+        "paused_ms": COUNTDOWN_PAUSE_MS,
         # Endless-only state: the current wave's generated map and the enemy
         # counts used to validate eliminations server-side.
         "ended": False,
@@ -979,7 +1024,9 @@ def handle_endless_game_event(run_id, game_state, tank_type):
     }
 
     if wave_complete:
+        # Cleared-wave freeze plus the next wave's start countdown.
         add_backend_pause(game_state, CLEARED_TRANSITION_PAUSE_MS)
+        add_backend_pause(game_state, COUNTDOWN_PAUSE_MS)
         game_state["completed_levels"].append(current_wave)
         next_wave = current_wave + 1
         game_state["current_level"] = next_wave
@@ -1013,7 +1060,9 @@ async def game_event(data: GameEventRequest):
     if TANK_TYPES[tank_type] == "player":
       logger.info(f"{run_id} was eliminated")
       game_state["deaths"] += 1
+      # Failed freeze plus the retry's start countdown.
       add_backend_pause(game_state, FAILED_TRANSITION_PAUSE_MS)
+      add_backend_pause(game_state, COUNTDOWN_PAUSE_MS)
       
       # Reset tank eliminations for current level
       if current_level in game_state["tanks_eliminated"]:
@@ -1069,6 +1118,9 @@ async def game_event(data: GameEventRequest):
         next_map_file = MAPS_DIR / f"level_{next_level}.txt"
         
         if next_map_file.exists():
+            # Next level loads, so exclude its start countdown too. (The
+            # game-complete branch below has no next level, so no countdown.)
+            add_backend_pause(game_state, COUNTDOWN_PAUSE_MS)
             game_state["current_level"] = next_level
             response["next_level"] = next_level
             response["message"] = "Level complete! Advancing to next level."
@@ -1253,3 +1305,49 @@ async def get_leaderboard(
             "has_more": offset + limit < len(grouped_entries),
             "mode": run_mode
         }
+
+
+class AdminLoginRequest(BaseModel):
+    password: str = Field(default="", max_length=200)
+
+
+@router.post("/admin/login")
+async def admin_login(data: AdminLoginRequest):
+    if not ADMIN_PASSWORD or data.password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid admin password")
+    return {"ok": True}
+
+
+@router.get("/admin/records")
+async def admin_records(_: bool = Depends(verify_admin), db: AsyncSession = Depends(get_db)):
+    tables = {}
+    for table_key, model in ADMIN_TABLES.items():
+        if table_key == "contacts":
+            order = (desc(model.submission_date),)
+        else:
+            order = (desc(model.completed_levels), model.time_seconds.asc())
+        result = await db.execute(select(model).order_by(*order).limit(500))
+        rows = result.scalars().all()
+        tables[table_key] = [serialize_admin_row(table_key, row) for row in rows]
+    return {"tables": tables}
+
+
+@router.delete("/admin/records/{table_key}/{record_id}")
+async def admin_delete_record(
+    table_key: str,
+    record_id: int,
+    _: bool = Depends(verify_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    model = ADMIN_TABLES.get(table_key)
+    if model is None:
+        raise HTTPException(status_code=400, detail="Unknown table")
+
+    result = await db.execute(select(model).where(model.id == record_id))
+    row = result.scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Record not found")
+
+    await db.delete(row)
+    await db.commit()
+    return {"deleted": True, "table": table_key, "id": record_id}

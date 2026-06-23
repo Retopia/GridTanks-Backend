@@ -27,14 +27,13 @@ def main() -> int:
 
     python = sys.executable
     if not os.environ.get("VIRTUAL_ENV"):
-        venv_dir = backend_dir / "venv"
-        if os.name == "nt":
-            venv_python = venv_dir / "Scripts" / "python.exe"
-        else:
-            venv_python = venv_dir / "bin" / "python"
-
-        if venv_python.exists():
-            python = str(venv_python)
+        # Prefer a project virtualenv. Supports both ".venv" and "venv".
+        rel_python = "Scripts/python.exe" if os.name == "nt" else "bin/python"
+        for venv_name in (".venv", "venv"):
+            venv_python = backend_dir / venv_name / rel_python
+            if venv_python.exists():
+                python = str(venv_python)
+                break
 
     command = [
         python,
@@ -52,8 +51,9 @@ def main() -> int:
 
     command.extend(uvicorn_args)
 
+    reload_state = "off" if args.no_reload else "on"
     print(f"Starting GridTanks backend on http://{args.host}:{args.port}")
-    print(f"ENVIRONMENT={env['ENVIRONMENT']}")
+    print(f"ENVIRONMENT={env['ENVIRONMENT']} | python={python} | auto-reload={reload_state}")
 
     return subprocess.call(command, cwd=backend_dir, env=env)
 
