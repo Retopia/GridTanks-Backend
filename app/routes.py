@@ -961,6 +961,10 @@ async def start_game(data: StartGameRequest | None = Body(default=None)):
         "mode": run_mode,
         # Seeded with one countdown so level 1's "Get Ready" is excluded too.
         "paused_ms": COUNTDOWN_PAUSE_MS,
+        # True between a level/wave clear response and the following /level
+        # request. Duplicate client kill events during this handoff are ignored
+        # instead of being counted against the next map before it has loaded.
+        "awaiting_level_load": False,
         # Endless-only state: the current wave's generated map and the enemy
         # counts used to validate eliminations server-side.
         "ended": False,
@@ -977,6 +981,14 @@ def handle_endless_game_event(run_id, game_state, tank_type):
 
     if game_state.get("ended"):
         return {"message": "Run already over", "game_complete": True, "pause_ms": 0}
+
+    if game_state.get("awaiting_level_load"):
+        return {
+            "message": "Wave already cleared; waiting for next wave load.",
+            "level_complete": True,
+            "next_level": current_wave,
+            "pause_ms": 0
+        }
 
     if TANK_TYPES[tank_type] == "player":
         # Endless is one life: dying ends the run.
@@ -1030,6 +1042,7 @@ def handle_endless_game_event(run_id, game_state, tank_type):
         game_state["completed_levels"].append(current_wave)
         next_wave = current_wave + 1
         game_state["current_level"] = next_wave
+        game_state["awaiting_level_load"] = True
         # Clear the cached wave so the next /level call generates a new one.
         game_state["endless_wave_map"] = None
         game_state["endless_wave_counts"] = None
@@ -1056,6 +1069,14 @@ async def game_event(data: GameEventRequest):
 
     if is_endless_mode(game_state.get("mode")):
         return handle_endless_game_event(run_id, game_state, tank_type)
+
+    if game_state.get("awaiting_level_load"):
+        return {
+            "message": "Level already complete; waiting for next level load.",
+            "level_complete": True,
+            "next_level": current_level,
+            "pause_ms": 0
+        }
 
     if TANK_TYPES[tank_type] == "player":
       logger.info(f"{run_id} was eliminated")
@@ -1122,6 +1143,7 @@ async def game_event(data: GameEventRequest):
             # game-complete branch below has no next level, so no countdown.)
             add_backend_pause(game_state, COUNTDOWN_PAUSE_MS)
             game_state["current_level"] = next_level
+            game_state["awaiting_level_load"] = True
             response["next_level"] = next_level
             response["message"] = "Level complete! Advancing to next level."
             response["pause_ms"] = CLEARED_TRANSITION_PAUSE_MS
@@ -1151,12 +1173,14 @@ async def get_current_level(data: RunRequest):
             game_state["endless_wave_map"] = map_text
             game_state["endless_wave_counts"] = tank_counts
 
+        game_state["awaiting_level_load"] = False
         return PlainTextResponse(game_state["endless_wave_map"])
 
     map_file = MAPS_DIR / f"level_{current_level}.txt"
     if not map_file.exists():
         return {"game_complete": True, "final_level": current_level - 1}
 
+    game_state["awaiting_level_load"] = False
     return PlainTextResponse(map_file.read_text())
 
 @router.post("/get-final-stats")
