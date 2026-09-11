@@ -13,10 +13,17 @@ from uuid import uuid4
 from pydantic import BaseModel, Field, field_validator
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 
 from .database import get_db
-from .models import LeaderboardEntry, CoopLeaderboardEntry, EndlessLeaderboardEntry, CoopEndlessLeaderboardEntry, ContactInfo
+from .models import (
+    LeaderboardEntry,
+    CoopLeaderboardEntry,
+    EndlessLeaderboardEntry,
+    CoopEndlessLeaderboardEntry,
+    ContactInfo,
+    GameSession,
+)
 
 
 router = APIRouter()
@@ -180,12 +187,22 @@ def verify_admin(x_admin_password: str = Header(default="")):
 
 
 def serialize_admin_row(table_key, row):
+    if table_key == "game_sessions":
+        return {
+            "id": row.id,
+            "run_id": row.run_id,
+            "mode": row.mode,
+            "status": row.status,
+            "date": row.started_at.strftime("%m/%d/%Y %I:%M %p") if row.started_at else "",
+            "timestamp": row.started_at.isoformat() if row.started_at else ""
+        }
     if table_key == "contacts":
         return {
             "id": row.id,
             "username": row.username,
             "email": row.email,
-            "date": row.submission_date.strftime("%m/%d/%Y") if row.submission_date else ""
+            "date": row.submission_date.strftime("%m/%d/%Y %I:%M %p") if row.submission_date else "",
+            "timestamp": row.submission_date.isoformat() if row.submission_date else ""
         }
     return {
         "id": row.id,
@@ -193,7 +210,8 @@ def serialize_admin_row(table_key, row):
         "completed_levels": row.completed_levels,
         "time": row.formatted_time,
         "deaths": row.deaths,
-        "date": row.date_submitted.strftime("%m/%d/%Y") if row.date_submitted else ""
+        "date": row.date_submitted.strftime("%m/%d/%Y %I:%M %p") if row.date_submitted else "",
+        "timestamp": row.date_submitted.isoformat() if row.date_submitted else ""
     }
 
 
@@ -943,13 +961,25 @@ async def room_socket(websocket: WebSocket, room_code: str, token: str):
         await broadcast_room_state(active_room)
 
 @router.post("/start-game")
-async def start_game(data: StartGameRequest | None = Body(default=None)):
+async def start_game(
+    data: StartGameRequest | None = Body(default=None),
+    db: AsyncSession = Depends(get_db)
+):
     # Clean up old runs occasionally
     if len(ACTIVE_RUNS) > 100:  # Arbitrary threshold
         cleanup_old_runs()
 
     run_mode = normalize_run_mode(data.mode if data else None)
     run_id = str(uuid4())
+
+    # Keep starts after the process restarts so admins can audit recent activity.
+    db.add(GameSession(run_id=run_id, mode=run_mode))
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception("Could not record game start %s", run_id)
+        raise HTTPException(status_code=503, detail="Could not start game")
 
     ACTIVE_RUNS[run_id] = {
         "current_level": 1,
@@ -1255,6 +1285,16 @@ async def submit_score(data: SubmitScoreRequest, db: AsyncSession = Depends(get_
     )
     
     db.add(leaderboard_entry)
+
+    session_result = await db.execute(
+        select(GameSession).where(GameSession.run_id == run_id)
+    )
+    game_session = session_result.scalar_one_or_none()
+    if game_session:
+        game_session.status = "submitted"
+        game_session.ended_at = func.now()
+        game_session.completed_levels = completed_levels
+        game_session.deaths = deaths
     
     # Store email separately if provided
     if email and email.strip():
@@ -1345,15 +1385,41 @@ async def admin_login(data: AdminLoginRequest):
 @router.get("/admin/records")
 async def admin_records(_: bool = Depends(verify_admin), db: AsyncSession = Depends(get_db)):
     tables = {}
+    leaderboard_submissions = []
     for table_key, model in ADMIN_TABLES.items():
         if table_key == "contacts":
             order = (desc(model.submission_date),)
         else:
-            order = (desc(model.completed_levels), model.time_seconds.asc())
-        result = await db.execute(select(model).order_by(*order).limit(500))
+            order = (desc(model.date_submitted), desc(model.id))
+        result = await db.execute(select(model).order_by(*order))
         rows = result.scalars().all()
-        tables[table_key] = [serialize_admin_row(table_key, row) for row in rows]
-    return {"tables": tables}
+        serialized_rows = [serialize_admin_row(table_key, row) for row in rows]
+        tables[table_key] = serialized_rows
+        if table_key != "contacts":
+            leaderboard_submissions.extend(
+                {**row, "table_key": table_key, "mode": table_key}
+                for row in serialized_rows
+            )
+
+    leaderboard_submissions.sort(
+        key=lambda row: (row.get("timestamp", ""), row.get("id", 0)),
+        reverse=True
+    )
+
+    sessions_result = await db.execute(
+        select(GameSession)
+        .order_by(desc(GameSession.started_at), desc(GameSession.id))
+        .limit(200)
+    )
+    recent_games = [
+        serialize_admin_row("game_sessions", row)
+        for row in sessions_result.scalars().all()
+    ]
+    return {
+        "tables": tables,
+        "leaderboard_submissions": leaderboard_submissions,
+        "recent_games": recent_games,
+    }
 
 
 @router.delete("/admin/records/{table_key}/{record_id}")
