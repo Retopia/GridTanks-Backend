@@ -72,3 +72,18 @@ class ContactInfo(Base):
     username = Column(String(20), nullable=False, index=True)
     email = Column(String(255), nullable=False)
     submission_date = Column(DateTime, default=func.now(), nullable=False)
+
+
+class GameSession(Base):
+    """Persistent audit trail for game starts shown in the admin page."""
+
+    __tablename__ = "game_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(String(36), nullable=False, unique=True, index=True)
+    mode = Column(String(20), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="active")
+    started_at = Column(DateTime, default=func.now(), nullable=False, index=True)
+    ended_at = Column(DateTime, nullable=True)
+    completed_levels = Column(Integer, nullable=True)
+    deaths = Column(Integer, nullable=True)
