@@ -794,6 +794,17 @@ async def room_socket(websocket: WebSocket, room_code: str, token: str):
 
     await broadcast_room_state(room)
 
+    # Only room members receive the ICE configuration (including optional TURN credentials).
+    try:
+        ice_servers = json.loads(os.environ.get("COOP_ICE_SERVERS", '[{"urls":"stun:stun.l.google.com:19302"}]'))
+        if not isinstance(ice_servers, list):
+            raise ValueError("ICE servers must be a list")
+    except (ValueError, TypeError):
+        ice_servers = [{"urls": "stun:stun.l.google.com:19302"}]
+    await send_ws_message(websocket, {
+        "type": "rtc_config", "run_id": room.get("run_id"), "ice_servers": ice_servers,
+    })
+
     try:
         while True:
             raw_message = await websocket.receive_text()
@@ -804,6 +815,9 @@ async def room_socket(websocket: WebSocket, room_code: str, token: str):
                 await send_ws_error(websocket, "Invalid message format.")
                 continue
 
+            if not isinstance(parsed, dict):
+                await send_ws_error(websocket, "Invalid message format.")
+                continue
             message_type = parsed.get("type")
 
             latest_room = ACTIVE_ROOMS.get(normalized_code)
@@ -817,6 +831,30 @@ async def room_socket(websocket: WebSocket, room_code: str, token: str):
                 await send_ws_error(websocket, "Invalid room token.")
                 await websocket.close(code=1008)
                 return
+
+            if message_type == "rtc_signal":
+                signal = parsed.get("payload")
+                kind = signal.get("kind") if isinstance(signal, dict) else None
+                if (not latest_room.get("game_started")
+                        or parsed.get("run_id") != latest_room.get("run_id")
+                        or kind not in ("ready", "offer", "answer", "candidate")
+                        or not isinstance(signal.get("id"), str)
+                        or len(signal["id"]) > 80
+                        or len(raw_message) > 65536
+                        or (kind == "offer" and latest_role != "host")
+                        or (kind == "answer" and latest_role != "guest")):
+                    continue
+                now = time.monotonic()
+                window, count = latest_member.get("rtc_rate", (now, 0))
+                if now - window >= 1:
+                    window, count = now, 0
+                latest_member["rtc_rate"] = (window, count + 1)
+                if count >= 100:
+                    continue
+                await forward_to_role(latest_room, "guest" if latest_role == "host" else "host", {
+                    "type": "rtc_signal", "run_id": latest_room.get("run_id"), "payload": signal,
+                })
+                continue
 
             if message_type == "set_ready":
                 latest_member["ready"] = bool(parsed.get("ready"))
@@ -917,6 +955,7 @@ async def room_socket(websocket: WebSocket, room_code: str, token: str):
 
                 payload = {
                     "type": "coop_input",
+                    "stream": parsed.get("stream"), "seq": parsed.get("seq"),
                     "payload": parsed.get("payload", {}),
                     "room_code": latest_room["room_code"],
                     "run_id": latest_room.get("run_id")
@@ -931,6 +970,7 @@ async def room_socket(websocket: WebSocket, room_code: str, token: str):
 
                 payload = {
                     "type": "coop_snapshot",
+                    "stream": parsed.get("stream"), "seq": parsed.get("seq"),
                     "payload": parsed.get("payload", {}),
                     "room_code": latest_room["room_code"],
                     "run_id": latest_room.get("run_id")
